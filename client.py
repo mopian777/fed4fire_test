@@ -10,10 +10,9 @@ PORT = 5000
 
 def discover_server(port=PORT, timeout=0.2):
     """
-    在本地子网（同一个 /24 网段）里扫描哪个 IP 的 port=5000 能连通，
-    第一个连通的就认为是 server。
+    在本地 /24 网段扫描哪个 IP 的 port=5000 能连通，
+    第一个连通的就当作 server。
     """
-    # 取本机 IP（hostname -I 的第一个）
     out = subprocess.check_output(["hostname", "-I"]).decode().split()
     if not out:
         raise RuntimeError("Cannot get local IP from 'hostname -I'")
@@ -67,7 +66,9 @@ def main():
         s.close()
 
     avg = resp["avg"]
-    print("[{}] Received global average = {} (server={})".format(client_id, avg, server_host))
+    print("[{}] Received global average = {} (server={})".format(
+        client_id, avg, server_host
+    ))
 
 
 if __name__ == "__main__":
