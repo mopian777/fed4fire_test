@@ -3,9 +3,9 @@ import socket
 import threading
 import json
 
-HOST = "0.0.0.0"      # 监听所有网卡
+HOST = "0.0.0.0"
 PORT = 5000
-NUM_CLIENTS = 2       # 客户端数量：client1 + client2
+NUM_CLIENTS = 2   # client1 + client2
 
 clients_values = {}
 lock = threading.Lock()
@@ -16,7 +16,17 @@ def handle_client(conn, addr):
     print("[+] Connection from {}".format(addr))
     try:
         raw = conn.recv(4096).decode("utf-8").strip()
-        data = json.loads(raw)
+        if not raw:
+            # 探测/空连接（例如 client 在扫描端口时产生），直接忽略
+            print("  - Empty payload from {}, ignoring".format(addr))
+            return
+
+        try:
+            data = json.loads(raw)
+        except ValueError as e:
+            print("Error parsing JSON from {}: {}".format(addr, e))
+            return
+
         cid = data["client_id"]
         value = float(data["value"])
 
@@ -35,6 +45,7 @@ def handle_client(conn, addr):
         resp = json.dumps({"avg": avg}).encode("utf-8")
         conn.sendall(resp)
         print("  - Sent avg {} to {}".format(avg, cid))
+
     except Exception as e:
         print("Error: {}".format(e))
     finally:
