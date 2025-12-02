@@ -7,7 +7,7 @@ HOST = "0.0.0.0"
 PORT = 5000
 NUM_CLIENTS = 2   # client1 + client2
 
-clients_values = {}
+clients_weights = {}
 lock = threading.Lock()
 all_received = threading.Event()
 
@@ -17,7 +17,7 @@ def handle_client(conn, addr):
     try:
         raw = conn.recv(4096).decode("utf-8").strip()
         if not raw:
-            # 探测/空连接（例如 client 在扫描端口时产生），直接忽略
+            # 探测 / 空连接（比如 client 在扫描端口时产生），直接忽略
             print("  - Empty payload from {}, ignoring".format(addr))
             return
 
@@ -28,21 +28,29 @@ def handle_client(conn, addr):
             return
 
         cid = data["client_id"]
-        value = float(data["value"])
+        weights = data["weights"]   # 形如 [w, b]
+        print("  - Received from {}: {}".format(cid, weights))
 
         with lock:
-            clients_values[cid] = value
-            print("  - Received from {}: {}".format(cid, value))
-            if len(clients_values) == NUM_CLIENTS:
+            clients_weights[cid] = weights
+            if len(clients_weights) == NUM_CLIENTS:
                 all_received.set()
 
         # 等所有客户端都发完
         all_received.wait()
 
+        # FedAvg：对每个参数维度做平均
         with lock:
-            avg = sum(clients_values.values()) / float(len(clients_values))
+            num = float(len(clients_weights))
+            dim = len(weights)
+            avg = [0.0] * dim
+            for wlist in clients_weights.values():
+                for i in range(dim):
+                    avg[i] += float(wlist[i])
+            for i in range(dim):
+                avg[i] /= num
 
-        resp = json.dumps({"avg": avg}).encode("utf-8")
+        resp = json.dumps({"avg_weights": avg}).encode("utf-8")
         conn.sendall(resp)
         print("  - Sent avg {} to {}".format(avg, cid))
 
