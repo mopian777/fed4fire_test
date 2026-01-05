@@ -4,8 +4,15 @@ import json
 import sys
 import time
 import subprocess
+import os
+import csv
 
-PORT = 6000  # 必须与 net_server.py 一致
+PORT = 6000   # 必须与 net_server.py 一致
+
+ROUNDS = 10          # 测 10 轮
+NUM_PACKETS = 50     # 每轮发多少个探测包（可调）
+INTERVAL = 0.1       # 包间隔秒
+TIMEOUT = 1.0        # 等 echo 的超时时间秒
 
 
 def discover_server(port=PORT,
@@ -13,7 +20,7 @@ def discover_server(port=PORT,
                     max_passes=5,
                     sleep_between=1.0):
     """
-    与你 FL 用的 discover_server 类似，在 /24 网段里找在哪个 IP 上 UDP 6000 能响应。
+    在本地 /24 网段扫描哪个 IP 的 UDP port=6000 能响应。
     """
     out = subprocess.check_output(["hostname", "-I"]).decode().split()
     if not out:
@@ -33,7 +40,6 @@ def discover_server(port=PORT,
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(per_ip_timeout)
             try:
-                # 发一个探测包，看能不能收到 echo
                 probe = {"client_id": "probe", "seq": -1}
                 sock.sendto(json.dumps(probe).encode("utf-8"), (ip, port))
                 _data, _addr = sock.recvfrom(4096)
@@ -55,11 +61,12 @@ def discover_server(port=PORT,
     )
 
 
-def measure(client_id, server_host, num_packets=100, interval=0.1, timeout=1.0):
+def measure_once(client_id, server_host,
+                 num_packets=NUM_PACKETS,
+                 interval=INTERVAL,
+                 timeout=TIMEOUT):
     """
     发送 num_packets 个 UDP 探测包，统计 RTT 与丢包。
-    interval: 两个包之间的发送间隔（秒）
-    timeout: 接收 echo 的超时时间（秒）
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
@@ -85,7 +92,6 @@ def measure(client_id, server_host, num_packets=100, interval=0.1, timeout=1.0):
                 continue
 
             if echo.get("seq") != seq:
-                # 序号不一致当作异常
                 continue
 
             rtt_ms = (t1 - t0) * 1000.0
@@ -110,20 +116,9 @@ def measure(client_id, server_host, num_packets=100, interval=0.1, timeout=1.0):
     else:
         rtt_min = rtt_max = rtt_avg = 0.0
 
-    # 近似单向 delay
-    delay_avg = rtt_avg / 2.0
+    delay_avg = rtt_avg / 2.0   # 近似单向时延
 
-    print("[{}-NET] sent = {}, received = {}, loss = {:.2%}".format(
-        client_id, sent, received, loss
-    ))
-    print("[{}-NET] RTT min/avg/max = {:.3f}/{:.3f}/{:.3f} ms".format(
-        client_id, rtt_min, rtt_avg, rtt_max
-    ))
-    print("[{}-NET] approx one-way delay(avg) = {:.3f} ms".format(
-        client_id, delay_avg
-    ))
-
-    return {
+    stats = {
         "sent": sent,
         "received": received,
         "loss": loss,
@@ -133,24 +128,106 @@ def measure(client_id, server_host, num_packets=100, interval=0.1, timeout=1.0):
         "delay_avg": delay_avg,
     }
 
+    return stats
+
+
+def multi_round_measure(client_id, mode, server_host,
+                        rounds=ROUNDS,
+                        num_packets=NUM_PACKETS,
+                        interval=INTERVAL,
+                        timeout=TIMEOUT,
+                        pause_between=1.0):
+    """
+    连续测 rounds 轮，每轮调用一次 measure_once，返回包含 round 字段的列表。
+    """
+    all_stats = []
+    for r in range(1, rounds + 1):
+        print("=== [{}-NET][{}] Round {} ===".format(client_id, mode, r))
+        stats = measure_once(client_id, server_host,
+                             num_packets=num_packets,
+                             interval=interval,
+                             timeout=timeout)
+        stats["round"] = r
+        all_stats.append(stats)
+
+        print("[{}-NET][{}] Round {}: sent={}, recv={}, loss={:.2%}, "
+              "rtt_avg={:.3f} ms, delay_avg={:.3f} ms".format(
+                  client_id, mode, r,
+                  stats["sent"], stats["received"], stats["loss"],
+                  stats["rtt_avg"], stats["delay_avg"]))
+        time.sleep(pause_between)
+    return all_stats
+
+
+def write_csv(stats_list, client_id, mode, server_host, csv_path):
+    """
+    把多轮测量结果追加写入 CSV。
+    CSV 列：mode, client_id, server_host, round, sent, received,
+           loss, rtt_min, rtt_avg, rtt_max, delay_avg
+    """
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, "a") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "mode",
+                "client_id",
+                "server_host",
+                "round",
+                "sent",
+                "received",
+                "loss",
+                "rtt_min_ms",
+                "rtt_avg_ms",
+                "rtt_max_ms",
+                "delay_avg_ms",
+            ])
+        for s in stats_list:
+            writer.writerow([
+                mode,
+                client_id,
+                server_host,
+                s["round"],
+                s["sent"],
+                s["received"],
+                s["loss"],
+                s["rtt_min"],
+                s["rtt_avg"],
+                s["rtt_max"],
+                s["delay_avg"],
+            ])
+
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 {} <client_id> [server_ip_or_auto]".format(sys.argv[0]))
+    if len(sys.argv) < 3:
+        print("Usage: python3 {} <client_id> <mode> [server_ip_or_auto]".format(
+            sys.argv[0]
+        ))
+        print("  example mode: baseline, fedavg")
         sys.exit(1)
 
     client_id = sys.argv[1]
+    mode = sys.argv[2]
 
-    if len(sys.argv) >= 3:
-        server_host = sys.argv[2]
+    if len(sys.argv) >= 4:
+        server_host = sys.argv[3]
     else:
         server_host = "auto"
 
     if server_host.lower() == "auto":
         server_host = discover_server()
 
-    print("[{}-NET] using server {}".format(client_id, server_host))
-    measure(client_id, server_host, num_packets=100, interval=0.1, timeout=1.0)
+    print("[{}-NET][{}] using server {}".format(client_id, mode, server_host))
+
+    stats_list = multi_round_measure(client_id, mode, server_host)
+
+    # CSV 保存路径：/tmp/net_results_<client_id>.csv
+    csv_path = "/tmp/net_results_{}.csv".format(client_id)
+    write_csv(stats_list, client_id, mode, server_host, csv_path)
+
+    print("[{}-NET][{}] results written to {}".format(
+        client_id, mode, csv_path
+    ))
 
 
 if __name__ == "__main__":
