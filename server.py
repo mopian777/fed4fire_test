@@ -1,62 +1,79 @@
 #!/usr/bin/env python3
 import socket
-import threading
 import json
 
 HOST = "0.0.0.0"
 PORT = 5000
-NUM_CLIENTS = 2   # client1 + client2
 
-clients_weights = {}
-lock = threading.Lock()
-all_received = threading.Event()
+NUM_CLIENTS = 2      # client1 + client2
+ROUNDS = 5           # 联邦训练总轮数
 
 
-def handle_client(conn, addr):
-    print("[+] Connection from {}".format(addr))
-    try:
+def run_round(sock, round_idx):
+    """
+    单轮联邦训练：
+    - 收集 NUM_CLIENTS 个客户端上传的 weights
+    - 做一次 FedAvg
+    - 把全局 weights 发回每个客户端
+    """
+    round_weights = []
+    conns = []
+    received = 0
+
+    print("[SERVER] Round {} waiting for {} client updates...".format(
+        round_idx, NUM_CLIENTS
+    ))
+
+    while received < NUM_CLIENTS:
+        conn, addr = sock.accept()
+        print("[+] Connection from {} in round {}".format(addr, round_idx))
         raw = conn.recv(4096).decode("utf-8").strip()
+
         if not raw:
-            # 探测 / 空连接（比如 client 在扫描端口时产生），直接忽略
+            # 探测 / 空连接（client 扫描端口时产生），忽略
             print("  - Empty payload from {}, ignoring".format(addr))
-            return
+            conn.close()
+            continue
 
         try:
             data = json.loads(raw)
         except ValueError as e:
-            print("Error parsing JSON from {}: {}".format(addr, e))
-            return
+            print("  - JSON error from {}: {}, ignoring".format(addr, e))
+            conn.close()
+            continue
 
-        cid = data["client_id"]
-        weights = data["weights"]   # 形如 [w, b]
-        print("  - Received from {}: {}".format(cid, weights))
+        cid = data.get("client_id", "unknown")
+        weights = data["weights"]  # 形如 [w, b]
+        client_round = data.get("round", None)
 
-        with lock:
-            clients_weights[cid] = weights
-            if len(clients_weights) == NUM_CLIENTS:
-                all_received.set()
+        print("  - Received from {} (client round {}): {}".format(
+            cid, client_round, weights
+        ))
 
-        # 等所有客户端都发完
-        all_received.wait()
+        round_weights.append(weights)
+        conns.append(conn)
+        received += 1
 
-        # FedAvg：对每个参数维度做平均
-        with lock:
-            num = float(len(clients_weights))
-            dim = len(weights)
-            avg = [0.0] * dim
-            for wlist in clients_weights.values():
-                for i in range(dim):
-                    avg[i] += float(wlist[i])
-            for i in range(dim):
-                avg[i] /= num
+    # FedAvg：对每个维度做平均
+    dim = len(round_weights[0])
+    avg = [0.0] * dim
+    num = float(len(round_weights))
 
-        resp = json.dumps({"avg_weights": avg}).encode("utf-8")
+    for wlist in round_weights:
+        for i in range(dim):
+            avg[i] += float(wlist[i])
+
+    for i in range(dim):
+        avg[i] /= num
+
+    print("[SERVER] Round {} global weights = {}".format(round_idx, avg))
+
+    resp_obj = {"avg_weights": avg, "round": round_idx}
+    resp = json.dumps(resp_obj).encode("utf-8")
+
+    # 把全局参数发回给本轮所有客户端，然后关闭连接
+    for conn in conns:
         conn.sendall(resp)
-        print("  - Sent avg {} to {}".format(avg, cid))
-
-    except Exception as e:
-        print("Error: {}".format(e))
-    finally:
         conn.close()
 
 
@@ -65,16 +82,15 @@ def main():
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, PORT))
     s.listen(NUM_CLIENTS)
-    print("[SERVER] Listening on {}:{} ...".format(HOST, PORT))
+    print("[SERVER] listening on {}:{} ...".format(HOST, PORT))
 
     try:
-        while True:
-            conn, addr = s.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr))
-            t.daemon = True
-            t.start()
+        for r in range(1, ROUNDS + 1):
+            run_round(s, r)
+
+        print("[SERVER] All {} rounds finished. Stopping.".format(ROUNDS))
     except KeyboardInterrupt:
-        print("\n[SERVER] Stopping.")
+        print("\n[SERVER] Interrupted, stopping.")
     finally:
         s.close()
 
