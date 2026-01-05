@@ -7,6 +7,9 @@ import subprocess
 import math
 
 PORT = 5000
+ROUNDS = 5          # 要与 server 保持一致
+LOCAL_STEPS = 50    # 每轮本地训练步数
+LR = 0.1            # 学习率
 
 
 def discover_server(port=PORT, timeout=0.2):
@@ -41,7 +44,7 @@ def discover_server(port=PORT, timeout=0.2):
 def make_local_data(n=100):
     """
     生成简单线性数据：y = 2*x + 3 + 噪声
-    这里 x 均匀采样 [0, 1]
+    x ~ U(0, 1)
     """
     xs = []
     ys = []
@@ -54,14 +57,13 @@ def make_local_data(n=100):
     return xs, ys
 
 
-def train_linear(xs, ys, lr=0.1, steps=200):
+def train_linear(xs, ys, w_init, b_init, lr=0.1, steps=50):
     """
-    训练一维线性模型 y_hat = w*x + b，MSE 损失
-    返回训练后的 (w, b) 和最终 loss
+    从给定 (w_init, b_init) 出发训练一维线性模型 y_hat = w*x + b
+    返回 (w, b, loss)
     """
-    w = random.uniform(-1.0, 1.0)
-    b = random.uniform(-1.0, 1.0)
-
+    w = float(w_init)
+    b = float(b_init)
     n = float(len(xs))
 
     for step in range(steps):
@@ -110,39 +112,56 @@ def main():
     if server_host.lower() == "auto":
         server_host = discover_server()
 
-    # 1. 本地生成数据 + 训练
+    # 固定本地数据集，跨轮共享
     xs, ys = make_local_data(n=100)
-    w, b, local_loss = train_linear(xs, ys, lr=0.1, steps=200)
 
-    print("[{}] Local model w = {:.4f}, b = {:.4f}, train_loss = {:.6f}".format(
-        client_id, w, b, local_loss
-    ))
+    # 初始模型参数（各 client 可不同）
+    w = random.uniform(-1.0, 1.0)
+    b = random.uniform(-1.0, 1.0)
 
-    # 2. 把本地参数发给 server
-    payload = {
-        "client_id": client_id,
-        "weights": [w, b]
-    }
+    print("[{}] Initial w = {:.4f}, b = {:.4f}".format(client_id, w, b))
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.connect((server_host, PORT))
-        s.sendall(json.dumps(payload).encode("utf-8"))
-        resp_raw = s.recv(4096).decode("utf-8")
-        resp = json.loads(resp_raw)
-    finally:
-        s.close()
+    for r in range(1, ROUNDS + 1):
+        # 1) 从当前全局参数 (w, b) 出发做本地训练
+        w, b, local_loss = train_linear(xs, ys, w, b, lr=LR, steps=LOCAL_STEPS)
 
-    avg_w, avg_b = resp["avg_weights"]
-    print("[{}] Global model w = {:.4f}, b = {:.4f}".format(
-        client_id, avg_w, avg_b
-    ))
+        print("[{}] Round {} local w = {:.4f}, b = {:.4f}, train_loss = {:.6f}".format(
+            client_id, r, w, b, local_loss
+        ))
 
-    # 3. 比较本地模型 vs 全局模型在本地数据上的 MSE
-    global_loss = mse_on_data(xs, ys, avg_w, avg_b)
-    print("[{}] Local MSE = {:.6f}, Global MSE = {:.6f}".format(
-        client_id, local_loss, global_loss
-    ))
+        # 2) 把本轮本地参数发给 server
+        payload = {
+            "client_id": client_id,
+            "round": r,
+            "weights": [w, b],
+        }
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.connect((server_host, PORT))
+            s.sendall(json.dumps(payload).encode("utf-8"))
+            resp_raw = s.recv(4096).decode("utf-8")
+            resp = json.loads(resp_raw)
+        finally:
+            s.close()
+
+        avg_w, avg_b = resp["avg_weights"]
+        server_round = resp.get("round", None)
+
+        print("[{}] Round {} global w = {:.4f}, b = {:.4f} (server round = {})".format(
+            client_id, r, avg_w, avg_b, server_round
+        ))
+
+        # 3) 比较本地模型 vs 全局模型在本地数据上的 MSE
+        global_loss = mse_on_data(xs, ys, avg_w, avg_b)
+        print("[{}] Round {} Local MSE = {:.6f}, Global MSE = {:.6f}".format(
+            client_id, r, local_loss, global_loss
+        ))
+
+        # 4) 把当前模型更新为全局模型，进入下一轮
+        w, b = avg_w, avg_b
+
+    print("[{}] Training finished after {} rounds.".format(client_id, ROUNDS))
 
 
 if __name__ == "__main__":
