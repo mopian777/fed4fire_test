@@ -5,6 +5,7 @@ import sys
 import random
 import subprocess
 import math
+import time
 
 PORT = 5000
 ROUNDS = 5          # 要与 server 保持一致
@@ -12,33 +13,54 @@ LOCAL_STEPS = 50    # 每轮本地训练步数
 LR = 0.1            # 学习率
 
 
-def discover_server(port=PORT, timeout=0.2):
+def discover_server(port=PORT,
+                    per_ip_timeout=0.05,
+                    max_passes=5,
+                    sleep_between=3.0):
     """
     在本地 /24 网段扫描哪个 IP 的 port=5000 能连通，
-    第一个连通的就当作 server。
+    最多扫描 max_passes 轮：
+      - 每轮遍历 10.x.x.1~254
+      - 每个 IP 尝试连接 per_ip_timeout 秒
+      - 一轮没找到就 sleep_between 秒再扫下一轮
+    这样即使 server 比 client 晚启动几十秒，也能被发现。
     """
     out = subprocess.check_output(["hostname", "-I"]).decode().split()
     if not out:
         raise RuntimeError("Cannot get local IP from 'hostname -I'")
     my_ip = out[0]
     prefix, last = my_ip.rsplit(".", 1)
+
     print("[discover] my_ip = {}, prefix = {}".format(my_ip, prefix))
 
-    for i in range(1, 255):
-        ip = "{}.{}".format(prefix, i)
-        if ip == my_ip:
-            continue
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        try:
-            s.connect((ip, port))
-            s.close()
-            print("[discover] found server at {}".format(ip))
-            return ip
-        except OSError:
-            continue
+    for attempt in range(1, max_passes + 1):
+        print("[discover] scan pass {}/{} on {}.0/24".format(
+            attempt, max_passes, prefix
+        ))
+        for i in range(1, 255):
+            ip = "{}.{}".format(prefix, i)
+            if ip == my_ip:
+                continue
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(per_ip_timeout)
+            try:
+                s.connect((ip, port))
+                s.close()
+                print("[discover] found server at {} (pass {})".format(ip, attempt))
+                return ip
+            except OSError:
+                # 连接失败就继续
+                continue
+        # 这一轮没找到，等等再来
+        print("[discover] no server found in pass {}, sleep {}s".format(
+            attempt, sleep_between
+        ))
+        time.sleep(sleep_between)
 
-    raise RuntimeError("Server not found on {}.0/24".format(prefix))
+    raise RuntimeError(
+        "Server not found on {}.0/24 after {} passes".format(prefix, max_passes)
+    )
+
 
 
 def make_local_data(n=100):
