@@ -16,7 +16,7 @@ def main():
             try:
                 msg = json.loads(data.decode("utf-8"))
             except ValueError:
-                # 无法解析就忽略
+                # 不是 JSON 就忽略
                 continue
 
             seq = msg.get("seq")
