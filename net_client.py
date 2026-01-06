@@ -9,7 +9,7 @@ import csv
 
 PORT = 6000   # 必须与 net_server.py 一致
 
-ROUNDS = 10          # 测 10 轮
+ROUNDS = 200          # 测 10 轮
 NUM_PACKETS = 50     # 每轮发多少个探测包（可调）
 INTERVAL = 0.1       # 包间隔秒
 TIMEOUT = 1.0        # 等 echo 的超时时间秒
