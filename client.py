@@ -6,6 +6,8 @@ import random
 import subprocess
 import math
 import time
+import csv
+import os
 
 PORT = 5000
 
@@ -17,7 +19,7 @@ LOCAL_STEPS = 50
 LR = 0.1   # 本地 SGD 学习率
 
 
-# ----------- 工具函数：发现 server IP（沿用你现在的 auto 模式） -----------
+# ----------- 工具函数：发现 server IP（沿用 auto 模式） -----------
 
 def discover_server(port=PORT,
                     per_ip_timeout=0.05,
@@ -113,6 +115,43 @@ def mse_on_data(xs, ys, w, b):
     return loss / n
 
 
+# ----------- CSV 工具：记录异步收敛曲线 -----------
+
+def init_async_csv(client_id):
+    """
+    确保 /tmp/async_curve_<client_id>.csv 存在并带表头。
+    """
+    csv_path = f"/tmp/async_curve_{client_id}.csv"
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "client_id",
+                "async_step",
+                "server_step",
+                "local_loss",
+                "global_loss",
+                "global_w",
+                "global_b",
+            ])
+    return csv_path
+
+
+def append_async_record(csv_path, client_id, async_step, server_step,
+                        local_loss, global_loss, global_w, global_b):
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            client_id,
+            async_step,
+            server_step,
+            local_loss,
+            global_loss,
+            global_w,
+            global_b,
+        ])
+
+
 # ----------- 主逻辑：FedAsync 客户端循环 -----------
 
 def main():
@@ -139,6 +178,10 @@ def main():
     w = random.uniform(-1.0, 1.0)
     b = random.uniform(-1.0, 1.0)
     print("[{}] initial local w = {:.4f}, b = {:.4f}".format(client_id, w, b))
+
+    # CSV 初始化
+    csv_path = init_async_csv(client_id)
+    print("[{}] logging async curve to {}".format(client_id, csv_path))
 
     # 为了制造“异步感”，不同客户端可以设不同 sleep
     if client_id.lower() == "client1":
@@ -176,10 +219,22 @@ def main():
                   client_id, step, local_loss, global_loss,
                   global_w, global_b, server_step))
 
-        # 3) 用最新全局覆盖本地模型，进入下一次异步更新
+        # 3) 写入 CSV 一条记录
+        append_async_record(
+            csv_path,
+            client_id=client_id,
+            async_step=step,
+            server_step=server_step,
+            local_loss=local_loss,
+            global_loss=global_loss,
+            global_w=global_w,
+            global_b=global_b,
+        )
+
+        # 4) 用最新全局覆盖本地模型，进入下一次异步更新
         w, b = global_w, global_b
 
-        # 4) 为了模拟异步客户端速度差异，sleep 一下
+        # 5) 模拟异步客户端速度差异
         if extra_sleep > 0:
             time.sleep(extra_sleep)
 
