@@ -4,7 +4,6 @@ import json
 import sys
 import random
 import subprocess
-import math
 import time
 import csv
 import os
@@ -121,7 +120,7 @@ def init_async_csv(client_id):
     """
     确保 /tmp/async_curve_<client_id>.csv 存在并带表头。
     """
-    csv_path = f"/tmp/async_curve_{client_id}.csv"
+    csv_path = "/tmp/async_curve_{}.csv".format(client_id)
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -214,8 +213,8 @@ def main():
 
         global_loss = mse_on_data(xs, ys, global_w, global_b)
 
-        print("[{}] async_step {} -> local_loss={:.6f}, "
-              "global_loss={:.6f}, global_w={:.4f}, global_b={:.4f}, server_step={}".format(
+        print("[{}] async_step {} -> local_loss={:.6f}, global_loss={:.6f}, "
+              "global_w={:.4f}, global_b={:.4f}, server_step={}".format(
                   client_id, step, local_loss, global_loss,
                   global_w, global_b, server_step))
 
