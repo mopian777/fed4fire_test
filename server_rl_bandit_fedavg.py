@@ -135,13 +135,7 @@ def run_server(host=HOST, port=PORT):
     print("[SERVER] Registered clients:", client_order)
     print("[SERVER] Actions mapping:", actions)
 
-    try:
-            bandit = EpsGreedyBandit(num_actions=num_actions, epsilon=0.1)
-
-    print("[SERVER] Registered clients:", client_order)
-    print("[SERVER] Actions mapping:", actions)
-
-    # ---- 打开 CSV 用于记录每轮指标 ----
+   
     csv_path = "/tmp/rl_bandit_fedavg_curve.csv"
     csv_f = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_f)
@@ -156,6 +150,7 @@ def run_server(host=HOST, port=PORT):
         "Q1",
         "Q2",
     ])
+    
     try:
         for round_idx in range(1, MAX_ROUNDS + 1):
             # ---- 用 bandit 选择本轮动作 ----
