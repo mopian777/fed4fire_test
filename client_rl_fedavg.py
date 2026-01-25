@@ -1,66 +1,48 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-RL-FedAvg client with simple server auto-discovery.
-
-Usage:
-  python3 client_rl_fedavg.py client1 10.11.16.103
-  python3 client_rl_fedavg.py client2 auto
-
-- If second arg is 'auto', client will:
-    1) detect its own IP, e.g. 10.11.16.101
-    2) derive prefix 10.11.16
-    3) scan 10.11.16.1-254: try TCP connect(port=PORT) with small timeout
-    4) first IP that accepts connection is treated as server_ip
-
-- Then it connects again as real FL client, sends JSON 'hello',
-  and participates in RL-FedAvg training with server_rl_bandit_fedavg.py.
+RL-FedAvg 客户端（配合 server_rl_bandit_fedavg.py 使用）
+- 本地模型: 线性回归 y = w * x + b
+- 本地数据: 在启动时按 client_id 生成不同分布的合成数据
+- 发现 server:
+    - 模式 "auto": 扫描本地前缀 10.x.x.x/24 找打开指定端口的 server
+    - 模式 "<ip>": 直接连接指定 server_ip
 """
 
-import json
+from __future__ import print_function
+
 import socket
-import struct
-import sys
-import random
+import json
 import time
+import random
+import math
+import sys
 
-PORT = 38001  # 和 server 保持一致
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+HOST = None          # 由 discover 决定
+PORT = 38001         # 要和 server 保持一致
+DISCOVER_RETRY = 5
 
 
-
-
-# ------------- JSON over TCP (length-prefixed) ---------------- #
+# ------------ 工具函数 ------------
 
 def send_json(sock, obj):
-    data = json.dumps(obj).encode("utf-8")
-    header = struct.pack("!I", len(data))
-    sock.sendall(header + data)
+    data = json.dumps(obj).encode("utf-8") + b"\n"
+    sock.sendall(data)
 
 
-def recv_exact(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Socket closed while reading")
-        buf += chunk
-    return buf
+def recv_json_line(fobj):
+    line = fobj.readline()
+    if not line:
+        return None
+    return json.loads(line.decode("utf-8").strip())
 
 
-def recv_json(sock):
-    header = recv_exact(sock, 4)
-    length, = struct.unpack("!I", header)
-    data = recv_exact(sock, length)
-    return json.loads(data.decode("utf-8"))
-
-
-# ---------------- IP / server discovery ---------------- #
-
-def get_local_ip():
-    """
-    Try to get local IP address by opening a dummy UDP socket.
-    """
+def get_my_ip():
+    """取本机在实验网络中的 IP（粗略版本）"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -72,205 +54,188 @@ def get_local_ip():
     return ip
 
 
-def discover_server(port, max_passes=5, timeout=0.15):
-    """
-    Scan my /24 subnet: 10.11.16.1-254, try TCP connect to given port.
-    First IP that accepts connection is treated as server_ip.
-
-    Returns: server_ip (string)
-    Raises: RuntimeError if not found after max_passes.
-    """
-    my_ip = get_local_ip()
+def discover_server(port, max_passes=5):
+    """自动扫描同一 /24 网段上的 server:port"""
+    my_ip = get_my_ip()
     parts = my_ip.split(".")
     if len(parts) != 4:
-        raise RuntimeError("Unexpected local IP: {}".format(my_ip))
-    prefix = ".".join(parts[:3])
+        raise RuntimeError("Cannot parse my_ip={}".format(my_ip))
+    prefix = ".".join(parts[:3])  # 例如 10.11.16
 
     print("[discover] my_ip = {}, prefix = {}.0/24".format(my_ip, prefix))
 
     for p in range(max_passes):
         print("[discover] pass {} ...".format(p + 1))
-        for host in range(1, 255):
-            addr = "%s.%d" % (prefix, host)
-            if addr == my_ip:
+        for last in range(1, 255):
+            cand = "{}.{}".format(prefix, last)
+            if cand == my_ip:
                 continue
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
             try:
-                # non-blocking connect test
-                err = s.connect_ex((addr, port))
-                s.close()
-                if err == 0:
-                    print("[discover] found server at {}".format(addr))
-                    return addr
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.2)
+                sock.connect((cand, port))
+                # 试发一个 ping
+                msg = {"type": "ping"}
+                send_json(sock, msg)
+                sock.close()
+                print("[discover] found server at {}:{}".format(cand, port))
+                return cand
             except Exception:
-                s.close()
                 continue
-    raise RuntimeError("Server not found on {}.0/24 after {} passes".format(prefix, max_passes))
+    raise RuntimeError("Server_not_found on {}.0/24 after {} passes".format(prefix, max_passes))
 
 
-# ---------------- Local data & training (no extra libs) ---------------- #
+# ------------ 本地数据与训练 ------------
 
-def make_local_dataset(n_samples, noise_std, seed):
-    """
-    Synthetic 1D regression: y = 2x + 3 + noise
-    Returns (xs, ys) as two Python lists of floats.
-    """
-    rng = random.Random(seed)
-    xs = []
-    ys = []
-    for _ in range(n_samples):
-        x = rng.random() * 10.0      # [0,10]
-        noise = rng.gauss(0.0, noise_std)
+def make_local_data(client_id, n_samples=100):
+    """为不同 client 生成稍微不同的线性数据"""
+    if np is None:
+        raise RuntimeError("numpy is required on client")
+
+    rng = np.random.RandomState(123 if client_id == "client1" else 456)
+
+    x = rng.uniform(-5.0, 5.0, size=(n_samples,))
+    noise = rng.normal(loc=0.0, scale=0.5, size=(n_samples,))
+
+    # 目标模型 y = 2x + 3，两个客户端加一点偏移
+    if client_id == "client1":
         y = 2.0 * x + 3.0 + noise
-        xs.append(x)
-        ys.append(y)
-    return xs, ys
+    else:
+        y = 2.1 * x + 2.9 + noise
+
+    return x, y
 
 
-def mse(xs, ys, w, b):
-    n = float(len(xs))
-    if n == 0:
-        return 0.0
-    loss = 0.0
-    for x, y in zip(xs, ys):
-        diff = w * x + b - y
-        loss += diff * diff
-    return loss / n
-
-
-def local_train(xs, ys, w_init, b_init, lr, local_epochs):
+def local_train(client_id, global_w, global_b, x, y, local_epochs, lr):
+    """在本地数据上做若干步梯度下降，并返回新参数和 MSE loss。
+       内置数值稳定保护：loss 爆掉或参数过大时回退到 global_w/b。
     """
-    Full-batch gradient descent on local data for local_epochs steps.
-    Returns (new_w, new_b, final_local_loss).
-    """
-    w = float(w_init)
-    b = float(b_init)
-    n = float(len(xs))
-    if n == 0:
-        return w, b, 0.0
+    if np is None:
+        raise RuntimeError("numpy is required on client")
+
+    w = float(global_w)
+    b = float(global_b)
+
+    n = float(len(x))
 
     for _ in range(local_epochs):
-        grad_w = 0.0
-        grad_b = 0.0
+        preds = w * x + b
+        errors = preds - y
+        grad_w = float(2.0 * np.dot(errors, x) / n)
+        grad_b = float(2.0 * np.sum(errors) / n)
 
-        for x, y in zip(xs, ys):
-            y_hat = w * x + b
-            diff = y_hat - y
-            grad_w += 2.0 * diff * x
-            grad_b += 2.0 * diff
+        w = w - lr * grad_w
+        b = b - lr * grad_b
 
-        grad_w /= n
-        grad_b /= n
+    # 计算 MSE
+    preds = w * x + b
+    errors = preds - y
+    loss = float(np.mean(errors ** 2))
 
-        w -= lr * grad_w
-        b -= lr * grad_b
+    # 数值稳定保护
+    unstable = False
+    if (not math.isfinite(loss)) or loss > 1e3:
+        unstable = True
+    if abs(w) > 1e6 or abs(b) > 1e6:
+        unstable = True
 
-    final_loss = mse(xs, ys, w, b)
-    return w, b, final_loss
+    if unstable:
+        print("[CLIENT {}] WARNING: unstable local training: loss={}, w={}, b={}. "
+              "resetting to global model.".format(client_id, loss, w, b))
+        loss = 1e3
+        w = float(global_w)
+        b = float(global_b)
+
+    return w, b, loss
 
 
-# ---------------- Main client logic ---------------- #
+# ------------ 客户端主逻辑 ------------
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: python3 {} <client_id> <server_ip|auto> [n_samples] [noise_std]"
-              .format(sys.argv[0]))
-        sys.exit(1)
-
-    client_id = sys.argv[1]
-    server_arg = sys.argv[2]
-
-    if len(sys.argv) >= 4:
-        n_samples = int(sys.argv[3])
+def run_client(client_id, mode, server_host=None, port=PORT):
+    if mode == "auto":
+        server_host = discover_server(port)
     else:
-        n_samples = 64
-    if len(sys.argv) >= 5:
-        noise_std = float(sys.argv[4])
-    else:
-        noise_std = 0.5
+        # mode 直接给 ip
+        server_host = mode
 
-    # Different seed per client, to simulate slightly different data
-    cid_lower = client_id.lower()
-    if cid_lower == "client1":
-        seed = 1
-    elif cid_lower == "client2":
-        seed = 2
-    else:
-        seed = 1234
-
-    xs, ys = make_local_dataset(n_samples, noise_std, seed)
-
-    # auto-discover server if needed
-    if server_arg.lower() == "auto":
-        try:
-            server_ip = discover_server(PORT)
-        except RuntimeError as e:
-            print("[CLIENT {}] {}".format(client_id, e))
-            sys.exit(1)
-    else:
-        server_ip = server_arg
-
-    print("[CLIENT {}] connect to {}:{} ...".format(client_id, server_ip, PORT))
+    print("[CLIENT {}] connecting to {}:{} ...".format(client_id, server_host, port))
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((server_ip, PORT))
+    sock.connect((server_host, port))
+    fobj = sock.makefile("rwb", buffering=0)
 
-    # send hello
+    # 发送 hello
     hello = {"type": "hello", "client_id": client_id}
     send_json(sock, hello)
     print("[CLIENT {}] sent hello".format(client_id))
 
+    # 准备本地数据
+    x, y = make_local_data(client_id)
+
     try:
         while True:
-            msg = recv_json(sock)
-            mtype = msg.get("type")
+            msg = recv_json_line(fobj)
+            if msg is None:
+                print("[CLIENT {}] server closed connection".format(client_id))
+                break
 
-            if mtype == "train":
-                round_id = msg.get("round")
-                weights = msg.get("weights", {})
-                local_epochs = int(msg.get("local_epochs", 5))
-                lr = float(msg.get("lr", 0.05))
-
-                w = float(weights.get("w", 0.0))
-                b = float(weights.get("b", 0.0))
-
-                print("[CLIENT {}] TRAIN round={}, w={:.4f}, b={:.4f}, "
-                      "local_epochs={}, lr={:.4f}".format(
-                          client_id, round_id, w, b, local_epochs, lr))
-
-                # local training
-                new_w, new_b, local_loss = local_train(xs, ys, w, b, lr, local_epochs)
-
-                print("[CLIENT {}] UPDATE round={} -> new_w={:.4f}, new_b={:.4f}, "
-                      "local_loss={:.6f}".format(
-                          client_id, round_id, new_w, new_b, local_loss))
-
-                reply = {
-                    "type": "update",
-                    "round": round_id,
-                    "client_id": client_id,
-                    "weights": {"w": new_w, "b": new_b},
-                    "local_loss": local_loss,
-                }
-                send_json(sock, reply)
-
-            elif mtype == "stop":
+            mtype = msg.get("type", "")
+            if mtype == "stop":
                 print("[CLIENT {}] received stop, exiting.".format(client_id))
                 break
 
-            else:
-                print("[CLIENT {}] unknown message type: {}".format(client_id, mtype))
-                # ignore and continue
+            if mtype != "train":
+                # 忽略其他类型（如 ping）
                 continue
 
-    except ConnectionError as e:
-        print("[CLIENT {}] connection error: {}".format(client_id, e))
-    except KeyboardInterrupt:
-        print("[CLIENT {}] interrupted by user".format(client_id))
+            round_idx = msg.get("round", 0)
+            global_w = msg.get("w", 0.0)
+            global_b = msg.get("b", 0.0)
+            local_epochs = int(msg.get("local_epochs", 5))
+            lr = float(msg.get("lr", 0.02))
+
+            print("[CLIENT {}] TRAIN round={}, w={:.4f}, b={:.4f}, local_epochs={}, lr={:.4f}".format(
+                client_id, round_idx, global_w, global_b, local_epochs, lr
+            ))
+
+            t0 = time.time()
+            new_w, new_b, local_loss = local_train(
+                client_id, global_w, global_b, x, y, local_epochs, lr
+            )
+            t1 = time.time()
+
+            print("[CLIENT {}] UPDATE round={} -> new_w={:.4f}, new_b={:.4f}, local_loss={}".format(
+                client_id, round_idx, new_w, new_b, local_loss
+            ))
+
+            resp = {
+                "type": "update",
+                "client_id": client_id,
+                "round": round_idx,
+                "new_w": new_w,
+                "new_b": new_b,
+                "local_loss": local_loss,
+                "train_time_ms": (t1 - t0) * 1000.0,
+            }
+            send_json(sock, resp)
+
     finally:
-        sock.close()
+        try:
+            fobj.close()
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
         print("[CLIENT {}] socket closed.".format(client_id))
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 3:
+        print("Usage: python3 client_rl_fedavg.py <client_id> <auto|server_ip>")
+        sys.exit(1)
+
+    cid = sys.argv[1]
+    mode_arg = sys.argv[2]  # "auto" 或者 具体 server IP
+
+    run_client(cid, mode_arg, port=PORT)
