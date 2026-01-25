@@ -25,7 +25,8 @@ import sys
 import random
 import time
 
-PORT = 6000  # 和新的 server 端口保持一致
+PORT = 38001  # 和 server 保持一致
+
 
 
 
