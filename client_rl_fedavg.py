@@ -2,41 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-RL-FedAvg client for jFed-style PPO/Bandit-FedAvg server.
+RL-FedAvg client with simple server auto-discovery.
 
-Protocol (must match server_rl_*_fedavg.py):
+Usage:
+  python3 client_rl_fedavg.py client1 10.11.16.103
+  python3 client_rl_fedavg.py client2 auto
 
-1. Connect to server (IP, port=5000 or configured).
-2. Immediately send a "hello" message:
-   {"type": "hello", "client_id": "client1" | "client2"}
+- If second arg is 'auto', client will:
+    1) detect its own IP, e.g. 10.11.16.101
+    2) derive prefix 10.11.16
+    3) scan 10.11.16.1-254: try TCP connect(port=PORT) with small timeout
+    4) first IP that accepts connection is treated as server_ip
 
-3. Then enter main loop:
-   - Receive JSON messages with 4-byte length prefix.
-   - If msg["type"] == "train":
-        {
-          "type": "train",
-          "round": r,
-          "weights": {"w": ..., "b": ...},
-          "local_epochs": 5,
-          "lr": 0.05
-        }
-     -> Run local training on this client's data starting from (w,b).
-     -> Compute final local_loss.
-     -> Send:
-        {
-          "type": "update",
-          "round": r,
-          "client_id": "<client_id>",
-          "weights": {"w": new_w, "b": new_b},
-          "local_loss": local_loss
-        }
-
-   - If msg["type"] == "stop":
-        break and close socket.
-
-Local model: simple 1D regression y = w*x + b on synthetic data
-y = 2x + 3 + noise. Each client uses a different random seed to simulate
-slightly non-IID data.
+- Then it connects again as real FL client, sends JSON 'hello',
+  and participates in RL-FedAvg training with server_rl_bandit_fedavg.py.
 """
 
 import json
@@ -44,9 +23,9 @@ import socket
 import struct
 import sys
 import random
+import time
 
-HOST = "127.0.0.1"   # not really used; we pass server_ip from argv
-PORT = 5000          # must match server
+PORT = 5000  # must match server_rl_bandit_fedavg.py
 
 
 # ------------- JSON over TCP (length-prefixed) ---------------- #
@@ -72,6 +51,60 @@ def recv_json(sock):
     length, = struct.unpack("!I", header)
     data = recv_exact(sock, length)
     return json.loads(data.decode("utf-8"))
+
+
+# ---------------- IP / server discovery ---------------- #
+
+def get_local_ip():
+    """
+    Try to get local IP address by opening a dummy UDP socket.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+def discover_server(port, max_passes=5, timeout=0.15):
+    """
+    Scan my /24 subnet: 10.11.16.1-254, try TCP connect to given port.
+    First IP that accepts connection is treated as server_ip.
+
+    Returns: server_ip (string)
+    Raises: RuntimeError if not found after max_passes.
+    """
+    my_ip = get_local_ip()
+    parts = my_ip.split(".")
+    if len(parts) != 4:
+        raise RuntimeError("Unexpected local IP: {}".format(my_ip))
+    prefix = ".".join(parts[:3])
+
+    print("[discover] my_ip = {}, prefix = {}.0/24".format(my_ip, prefix))
+
+    for p in range(max_passes):
+        print("[discover] pass {} ...".format(p + 1))
+        for host in range(1, 255):
+            addr = "%s.%d" % (prefix, host)
+            if addr == my_ip:
+                continue
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            try:
+                # non-blocking connect test
+                err = s.connect_ex((addr, port))
+                s.close()
+                if err == 0:
+                    print("[discover] found server at {}".format(addr))
+                    return addr
+            except Exception:
+                s.close()
+                continue
+    raise RuntimeError("Server not found on {}.0/24 after {} passes".format(prefix, max_passes))
 
 
 # ---------------- Local data & training (no extra libs) ---------------- #
@@ -139,13 +172,13 @@ def local_train(xs, ys, w_init, b_init, lr, local_epochs):
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python3 {} <client_id> <server_ip> [n_samples] [noise_std]".format(sys.argv[0]))
-        print("  client_id: e.g. client1 or client2")
-        print("  server_ip: e.g. 10.11.16.xxx")
+        print("Usage: python3 {} <client_id> <server_ip|auto> [n_samples] [noise_std]"
+              .format(sys.argv[0]))
         sys.exit(1)
 
     client_id = sys.argv[1]
-    server_ip = sys.argv[2]
+    server_arg = sys.argv[2]
+
     if len(sys.argv) >= 4:
         n_samples = int(sys.argv[3])
     else:
@@ -165,6 +198,16 @@ def main():
         seed = 1234
 
     xs, ys = make_local_dataset(n_samples, noise_std, seed)
+
+    # auto-discover server if needed
+    if server_arg.lower() == "auto":
+        try:
+            server_ip = discover_server(PORT)
+        except RuntimeError as e:
+            print("[CLIENT {}] {}".format(client_id, e))
+            sys.exit(1)
+    else:
+        server_ip = server_arg
 
     print("[CLIENT {}] connect to {}:{} ...".format(client_id, server_ip, PORT))
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
