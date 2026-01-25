@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-RL-FedAvg client for jFed-style PPO-FedAvg server.
+RL-FedAvg client for jFed-style PPO/Bandit-FedAvg server.
 
-Protocol (must match server_rl_fedavg.py):
+Protocol (must match server_rl_*_fedavg.py):
 
-1. Connect to server (IP, port=5000).
+1. Connect to server (IP, port=5000 or configured).
 2. Immediately send a "hello" message:
    {"type": "hello", "client_id": "client1" | "client2"}
 
@@ -34,8 +34,9 @@ Protocol (must match server_rl_fedavg.py):
    - If msg["type"] == "stop":
         break and close socket.
 
-This is a minimal demo: local model is y = w*x + b, trained with full-batch
-gradient descent on a synthetic dataset (y = 2x + 3 + noise).
+Local model: simple 1D regression y = w*x + b on synthetic data
+y = 2x + 3 + noise. Each client uses a different random seed to simulate
+slightly non-IID data.
 """
 
 import json
@@ -43,22 +44,20 @@ import socket
 import struct
 import sys
 import random
-from typing import Tuple, List
+
+HOST = "127.0.0.1"   # not really used; we pass server_ip from argv
+PORT = 5000          # must match server
 
 
-HOST = "127.0.0.1"
-PORT = 5000
+# ------------- JSON over TCP (length-prefixed) ---------------- #
 
-
-# ---------------- JSON over TCP (length-prefixed) ---------------- #
-
-def send_json(sock: socket.socket, obj: dict):
+def send_json(sock, obj):
     data = json.dumps(obj).encode("utf-8")
     header = struct.pack("!I", len(data))
     sock.sendall(header + data)
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
+def recv_exact(sock, n):
     buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -68,21 +67,23 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return buf
 
 
-def recv_json(sock: socket.socket) -> dict:
+def recv_json(sock):
     header = recv_exact(sock, 4)
-    (length,) = struct.unpack("!I", header)
+    length, = struct.unpack("!I", header)
     data = recv_exact(sock, length)
     return json.loads(data.decode("utf-8"))
 
 
 # ---------------- Local data & training (no extra libs) ---------------- #
 
-def make_local_dataset(n_samples: int, noise_std: float, seed: int) -> Tuple[List[float], List[float]]:
+def make_local_dataset(n_samples, noise_std, seed):
     """
     Synthetic 1D regression: y = 2x + 3 + noise
+    Returns (xs, ys) as two Python lists of floats.
     """
     rng = random.Random(seed)
-    xs, ys = [], []
+    xs = []
+    ys = []
     for _ in range(n_samples):
         x = rng.random() * 10.0      # [0,10]
         noise = rng.gauss(0.0, noise_std)
@@ -92,7 +93,7 @@ def make_local_dataset(n_samples: int, noise_std: float, seed: int) -> Tuple[Lis
     return xs, ys
 
 
-def mse(xs: List[float], ys: List[float], w: float, b: float) -> float:
+def mse(xs, ys, w, b):
     n = float(len(xs))
     if n == 0:
         return 0.0
@@ -103,14 +104,7 @@ def mse(xs: List[float], ys: List[float], w: float, b: float) -> float:
     return loss / n
 
 
-def local_train(
-    xs: List[float],
-    ys: List[float],
-    w_init: float,
-    b_init: float,
-    lr: float,
-    local_epochs: int,
-) -> Tuple[float, float, float]:
+def local_train(xs, ys, w_init, b_init, lr, local_epochs):
     """
     Full-batch gradient descent on local data for local_epochs steps.
     Returns (new_w, new_b, final_local_loss).
@@ -124,16 +118,13 @@ def local_train(
     for _ in range(local_epochs):
         grad_w = 0.0
         grad_b = 0.0
-        loss = 0.0
 
         for x, y in zip(xs, ys):
             y_hat = w * x + b
             diff = y_hat - y
-            loss += diff * diff
             grad_w += 2.0 * diff * x
             grad_b += 2.0 * diff
 
-        loss /= n
         grad_w /= n
         grad_b /= n
 
@@ -155,13 +146,20 @@ def main():
 
     client_id = sys.argv[1]
     server_ip = sys.argv[2]
-    n_samples = int(sys.argv[3]) if len(sys.argv) >= 4 else 64
-    noise_std = float(sys.argv[4]) if len(sys.argv) >= 5 else 0.5
+    if len(sys.argv) >= 4:
+        n_samples = int(sys.argv[3])
+    else:
+        n_samples = 64
+    if len(sys.argv) >= 5:
+        noise_std = float(sys.argv[4])
+    else:
+        noise_std = 0.5
 
-    # 每个 client 用不同 seed，模拟轻微 non-IID
-    if client_id.lower() == "client1":
+    # Different seed per client, to simulate slightly different data
+    cid_lower = client_id.lower()
+    if cid_lower == "client1":
         seed = 1
-    elif client_id.lower() == "client2":
+    elif cid_lower == "client2":
         seed = 2
     else:
         seed = 1234
@@ -172,7 +170,7 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((server_ip, PORT))
 
-    # 发送 hello
+    # send hello
     hello = {"type": "hello", "client_id": client_id}
     send_json(sock, hello)
     print("[CLIENT {}] sent hello".format(client_id))
@@ -195,7 +193,7 @@ def main():
                       "local_epochs={}, lr={:.4f}".format(
                           client_id, round_id, w, b, local_epochs, lr))
 
-                # 本地训练
+                # local training
                 new_w, new_b, local_loss = local_train(xs, ys, w, b, lr, local_epochs)
 
                 print("[CLIENT {}] UPDATE round={} -> new_w={:.4f}, new_b={:.4f}, "
@@ -217,7 +215,7 @@ def main():
 
             else:
                 print("[CLIENT {}] unknown message type: {}".format(client_id, mtype))
-                # 可以选择 break 或忽略，这里忽略
+                # ignore and continue
                 continue
 
     except ConnectionError as e:
