@@ -17,6 +17,7 @@ import time
 import math
 import random
 import threading
+import csv
 
 HOST = "0.0.0.0"
 PORT = 38001          # 你现在使用的端口
@@ -135,6 +136,27 @@ def run_server(host=HOST, port=PORT):
     print("[SERVER] Actions mapping:", actions)
 
     try:
+            bandit = EpsGreedyBandit(num_actions=num_actions, epsilon=0.1)
+
+    print("[SERVER] Registered clients:", client_order)
+    print("[SERVER] Actions mapping:", actions)
+
+    # ---- 打开 CSV 用于记录每轮指标 ----
+    csv_path = "/tmp/rl_bandit_fedavg_curve.csv"
+    csv_f = open(csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_f)
+    csv_writer.writerow([
+        "round",
+        "action_idx",
+        "use_client1",
+        "use_client2",
+        "global_loss",
+        "round_time_ms",
+        "Q0",
+        "Q1",
+        "Q2",
+    ])
+    try:
         for round_idx in range(1, MAX_ROUNDS + 1):
             # ---- 用 bandit 选择本轮动作 ----
             action_idx = bandit.select_action()
@@ -242,6 +264,22 @@ def run_server(host=HOST, port=PORT):
             # ---- 更新 bandit Q 值 ----
             bandit.update(action_idx, reward)
 
+             # 写入一行 CSV：这一轮用了哪些 client、loss 和 Q 值
+            use_c1 = 1 if client_order[0] in selected_clients else 0
+            use_c2 = 1 if client_order[1] in selected_clients else 0
+            q0 = bandit.q_values[0] if len(bandit.q_values) > 0 else 0.0
+            q1 = bandit.q_values[1] if len(bandit.q_values) > 1 else 0.0
+            q2 = bandit.q_values[2] if len(bandit.q_values) > 2 else 0.0
+            csv_writer.writerow([
+                round_idx,
+                action_idx,
+                use_c1,
+                use_c2,
+                global_loss,
+                round_time_ms,
+                q0, q1, q2,
+            ])
+
             # 打印一下 Q 状态
             parts = []
             for a in range(num_actions):
@@ -261,6 +299,13 @@ def run_server(host=HOST, port=PORT):
                 send_json(sock, stop_msg)
             except Exception:
                 pass
+                
+    finally:
+        try:
+            csv_f.close()
+            print("[SERVER] CSV saved to", csv_path)
+        except Exception:
+            pass
 
     finally:
         for cid, (sock, fobj) in clients.items():
