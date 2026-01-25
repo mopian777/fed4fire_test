@@ -301,8 +301,6 @@ def run_server(host=HOST, port=PORT):
             print("[SERVER] CSV saved to", csv_path)
         except Exception:
             pass
-
-    finally:
         for cid, (sock, fobj) in clients.items():
             try:
                 fobj.close()
