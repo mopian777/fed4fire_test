@@ -25,7 +25,8 @@ import sys
 import random
 import time
 
-PORT = 5000  # must match server_rl_bandit_fedavg.py
+PORT = 6000  # 和新的 server 端口保持一致
+
 
 
 # ------------- JSON over TCP (length-prefixed) ---------------- #
