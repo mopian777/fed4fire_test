@@ -25,7 +25,7 @@ TARGET_W = 2.0
 TARGET_B = 3.0
 
 NET_LOG_DIR = "/tmp"
-NET_PING_COUNT = 50     # 每轮 ping 包数，和前面实验保持一致
+NET_PING_COUNT = 50     # 每轮 ping 包数
 NET_MODE_NAME = "rl_fedavg"
 
 
@@ -49,18 +49,10 @@ def recv_json_line(fobj):
 
 
 # ----------------------------
-# 工具函数：发现 server（自动扫描 /24）
+# 自动发现 server
 # ----------------------------
 
 def discover_server(port, max_passes=5):
-    """
-    和你之前 baseline/FedAvg/FedAsync 用的一样的 auto discover 逻辑简化版：
-    - 先通过一个 UDP 探测拿到本机 IP；
-    - 扫描 /24 段，尝试 TCP 连接指定端口；
-    - 第一台能连通的就认为是 server。
-    返回: (server_host, prefix)
-    """
-    # 1) 猜本机 IP
     my_ip = "127.0.0.1"
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -78,7 +70,6 @@ def discover_server(port, max_passes=5):
 
     print("[discover] my_ip = %s, prefix = %s/24" % (my_ip, prefix))
 
-    # 2) 扫描 /24
     base = ".".join(prefix.split(".")[0:3])
     for p in range(max_passes):
         print("[discover] pass %d ..." % (p + 1))
@@ -101,13 +92,10 @@ def discover_server(port, max_passes=5):
 
 
 # ----------------------------
-# 网络测量：初始化 / ping / 记录 CSV
+# 网络测量 + CSV 记录
 # ----------------------------
 
 def init_net_logger(client_id):
-    """
-    确保 /tmp/rl_fedavg_curve_clientX.csv 存在并写好表头。
-    """
     if not os.path.exists(NET_LOG_DIR):
         try:
             os.makedirs(NET_LOG_DIR)
@@ -126,11 +114,6 @@ def init_net_logger(client_id):
 
 
 def measure_delay(server_host, count):
-    """
-    对 server_host 执行 ping，解析出 rtt min/avg/max，并返回：
-    sent, received, loss(0~1), rtt_min, rtt_avg, rtt_max, delay_avg
-    delay_avg = rtt_avg / 2  作为单向 delay 的近似。
-    """
     cmd = ["ping", "-c", str(count), server_host]
     try:
         p = subprocess.Popen(cmd,
@@ -139,7 +122,6 @@ def measure_delay(server_host, count):
         out, err = p.communicate(timeout=15)
         text = out.decode("utf-8", "ignore")
     except Exception:
-        # ping 失败时，返回全 0 + loss=1
         return 0, 0, 1.0, 0.0, 0.0, 0.0, 0.0
 
     sent = 0
@@ -152,7 +134,6 @@ def measure_delay(server_host, count):
     for line in text.splitlines():
         line = line.strip()
 
-        # "50 packets transmitted, 50 received, 0% packet loss, time 49048ms"
         if "packets transmitted" in line:
             parts = line.split(",")
             try:
@@ -163,7 +144,6 @@ def measure_delay(server_host, count):
             except Exception:
                 pass
 
-        # "rtt min/avg/max/mdev = 0.305/0.309/0.322/0.004 ms"
         if "min/avg/max" in line and "=" in line:
             try:
                 stats = line.split("=")[1].strip().split()[0].split("/")
@@ -180,22 +160,19 @@ def measure_delay(server_host, count):
 def log_delay(csv_path, client_id, server_host, round_idx,
               sent, received, loss,
               rtt_min, rtt_avg, rtt_max, delay_avg):
-    """
-    追加一行到 rl_fedavg_curve_clientX.csv
-    """
-    line = "{mode},{cid},{host},{rnd},{sent},{recv},{loss:.6f}," \
-           "{rtt_min:.6f},{rtt_avg:.6f},{rtt_max:.6f},{delay:.6f}\n".format(
-               mode=NET_MODE_NAME,
-               cid=str(client_id),
-               host=server_host,
-               rnd=int(round_idx),
-               sent=int(sent),
-               recv=int(received),
-               loss=float(loss),
-               rtt_min=float(rtt_min),
-               rtt_avg=float(rtt_avg),
-               rtt_max=float(rtt_max),
-               delay=float(delay_avg))
+    line = "%s,%s,%s,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f\n" % (
+        NET_MODE_NAME,
+        str(client_id),
+        server_host,
+        int(round_idx),
+        int(sent),
+        int(received),
+        float(loss),
+        float(rtt_min),
+        float(rtt_avg),
+        float(rtt_max),
+        float(delay_avg),
+    )
     with open(csv_path, "a") as f:
         f.write(line)
 
@@ -221,9 +198,6 @@ def mse_loss(w, b, x, y):
 
 
 def train_one_round(x, y, w, b, local_epochs, lr):
-    """
-    最简单的一阶 SGD：对 y = w*x + b 做几轮本地更新。
-    """
     w_local = float(w)
     b_local = float(b)
 
@@ -244,12 +218,7 @@ def train_one_round(x, y, w, b, local_epochs, lr):
 # ----------------------------
 
 def run_client(client_id, mode_arg, port=PORT):
-    """
-    client_id: "client1" / "client2"
-    mode_arg:  "auto" 或直接指定 server IP
-    """
 
-    # 1) 发现 server
     if mode_arg == "auto":
         server_host, prefix = discover_server(port)
     else:
@@ -258,12 +227,10 @@ def run_client(client_id, mode_arg, port=PORT):
     print("[CLIENT %s] connect to %s:%d ..." %
           (client_id, server_host, port))
 
-    # 2) 建立 TCP 连接
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((server_host, port))
     f = sock.makefile("r")
 
-    # 3) 发送 HELLO
     hello = {
         "type": "HELLO",
         "client_id": str(client_id)
@@ -271,14 +238,10 @@ def run_client(client_id, mode_arg, port=PORT):
     send_json(sock, hello)
     print("[CLIENT %s] sent HELLO" % client_id)
 
-    # 4) 准备本地数据
     x, y = make_local_data(client_id)
 
-    # 5) 初始化网络测量 CSV
     net_csv_path = init_net_logger(client_id)
 
-    # 可以用 round_idx 直接作为 CSV 里的 round
-    # （也可以额外维护 net_round 计数器，看你习惯）
     while True:
         msg = recv_json_line(f)
         if msg is None:
@@ -314,7 +277,6 @@ def run_client(client_id, mode_arg, port=PORT):
             }
             send_json(sock, resp)
 
-            # 6) 网络测量：每完成一轮训练后，ping 一次 server，并记录 CSV
             sent, received, loss, rtt_min, rtt_avg, rtt_max, delay_avg = \
                 measure_delay(server_host, NET_PING_COUNT)
 
@@ -338,7 +300,6 @@ def run_client(client_id, mode_arg, port=PORT):
             print("[CLIENT %s] received STOP. exiting." % client_id)
             break
         else:
-            # 未知消息，直接忽略
             print("[CLIENT %s] unknown message type: %s" %
                   (client_id, mtype))
 
@@ -351,10 +312,6 @@ def run_client(client_id, mode_arg, port=PORT):
     except Exception:
         pass
 
-
-# ----------------------------
-# 入口
-# ----------------------------
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
