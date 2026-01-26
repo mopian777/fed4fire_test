@@ -1,317 +1,269 @@
-# -*- coding: utf-8 -*-
-"""
-RL-Bandit 调度的 FedAvg 服务器（2 个客户端版本）
-- 模型: 简单线性回归 y = w * x + b
-- 动作空间:
-    a0: 使用 client1 + client2
-    a1: 只使用 client1
-    a2: 只使用 client2
-- 强化学习: epsilon-greedy bandit，在每轮用负的 global_loss 作为 reward
-"""
-
-from __future__ import print_function
+#!/usr/bin/env python3
+# Minimal RL-FedAvg server (bandit-style client selection), no torch, no typing
 
 import socket
 import json
-import time
-import math
 import random
-import threading
-import csv
+import time
+import os
 
-HOST = "0.0.0.0"
-PORT = 38001          # 你现在使用的端口
-MAX_ROUNDS = 200      # 训练轮数
-EXPECTED_CLIENTS = 2  # 这里假定就 2 个 client: client1, client2
+PORT = 38001          # 与 client_rl_fedavg.py 默认一致
+NUM_ROUNDS = 200
+LOCAL_EPOCHS = 5
+LR = 0.02
 
-# ------------ 工具函数 ------------
+# 日志文件：记录 bandit 决策和全局 loss，用于后续画图
+SERVER_LOG = "/tmp/rl_fedavg_bandit_server.csv"
+
+
+# ------------- JSON over TCP ------------- #
 
 def send_json(sock, obj):
-    data = json.dumps(obj).encode("utf-8") + b"\n"
-    sock.sendall(data)
+    data = json.dumps(obj) + "\n"
+    sock.sendall(data.encode("utf-8"))
 
 
 def recv_json_line(fobj):
-    """从 socket.makefile() 读取一行 JSON"""
     line = fobj.readline()
     if not line:
         return None
-    return json.loads(line.decode("utf-8").strip())
+    line = line.strip()
+    if not line:
+        return None
+    return json.loads(line)
 
 
-# ------------ Bandit 实现（带 NaN/inf 保护） ------------
+# ------------- Bandit（多臂老虎机）------------- #
 
-class EpsGreedyBandit(object):
-    def __init__(self, num_actions, epsilon=0.1):
-        self.num_actions = num_actions
-        self.epsilon = epsilon
-        self.q_values = [0.0] * num_actions
-        self.counts = [0] * num_actions
-
-    def select_action(self):
-        """带兜底的 epsilon-greedy:
-        - 只在 Q 是有限数的 action 上做选择
-        - 如果全是 NaN/inf，则退化为在所有 action 上随机
-        """
-        finite_actions = []
-        for a, q in enumerate(self.q_values):
-            if q is not None and math.isfinite(q):
-                finite_actions.append(a)
-
-        if not finite_actions:
-            # 全是 NaN / inf，退化为全部动作都可选
-            finite_actions = list(range(self.num_actions))
-
-        if random.random() < self.epsilon:
-            return random.choice(finite_actions)
-
-        best_a = finite_actions[0]
-        best_q = self.q_values[best_a]
-        for a in finite_actions[1:]:
-            if self.q_values[a] > best_q:
-                best_q = self.q_values[a]
-                best_a = a
-        return best_a
-
-    def update(self, action, reward):
-        """增量式更新 Q，忽略 NaN/inf 的 reward"""
-        if reward is None or (not math.isfinite(reward)):
-            return
-        self.counts[action] += 1
-        n = self.counts[action]
-        old_q = self.q_values[action]
-        self.q_values[action] = old_q + (reward - old_q) / float(n)
+def bandit_init(n_actions):
+    Q = [0.0] * n_actions   # 行动价值估计
+    N = [0] * n_actions     # 每个动作被选择次数
+    return Q, N
 
 
-# ------------ 服务器主逻辑 ------------
+def bandit_select_action(Q, N, eps=0.1):
+    """
+    简单 epsilon-greedy：
+      - 以 eps 概率探索（随机选动作）
+      - 以 1-eps 概率利用（选当前 Q 最大的动作）
+    """
+    n_actions = len(Q)
+    if random.random() < eps:
+        return random.randint(0, n_actions - 1)
 
-def run_server(host=HOST, port=PORT):
-    random.seed(2025)
+    best_q = None
+    best_idx = 0
+    for i in range(n_actions):
+        q = Q[i]
+        if best_q is None or q > best_q:
+            best_q = q
+            best_idx = i
+    return best_idx
 
-    # 初始化全局模型
-    global_w = 0.0
-    global_b = 0.0
 
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # 允许端口复用，方便重启
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((host, port))
-    server_sock.listen(5)
+def bandit_update(Q, N, action_idx, reward):
+    """
+    增量式平均更新：Q[a] <- Q[a] + (1/N[a]) * (reward - Q[a])
+    """
+    if action_idx < 0 or action_idx >= len(Q):
+        return
+    N[action_idx] += 1
+    n = float(N[action_idx])
+    alpha = 1.0 / n
+    old_q = Q[action_idx]
+    Q[action_idx] = old_q + alpha * (reward - old_q)
 
-    print("[SERVER] Listening on {}:{} ...".format(host, port))
 
-    clients = {}      # client_id -> (sock, fobj)
-    client_order = [] # 记录 client_id 的顺序，方便 action 映射
+# ------------- Helper ------------- #
 
-    # -------- 等待客户端连接并握手 --------
-    while len(clients) < EXPECTED_CLIENTS:
-        conn, addr = server_sock.accept()
-        fobj = conn.makefile("rwb", buffering=0)
-        hello = recv_json_line(fobj)
-        if not hello or hello.get("type") != "hello":
-            conn.close()
-            continue
-        cid = hello.get("client_id", "unknown")
-        print("[SERVER] Connection from {} as {}".format(addr, cid))
-
-        clients[cid] = (conn, fobj)
-        client_order.append(cid)
-
-    if len(client_order) != EXPECTED_CLIENTS:
-        print("[SERVER] Warning: expected {} clients, got {}".format(
-            EXPECTED_CLIENTS, len(client_order)
-        ))
-
-    # 定义动作 -> 参与的 client_id
-    # 这里假定 client_order[0] = "client1", client_order[1] = "client2"
-    actions = [
-        [client_order[0], client_order[1]],  # a0: 两个都用
-        [client_order[0]],                  # a1: 只 client1
-        [client_order[1]],                  # a2: 只 client2
-    ]
-    num_actions = len(actions)
-    bandit = EpsGreedyBandit(num_actions=num_actions, epsilon=0.1)
-
-    print("[SERVER] Registered clients:", client_order)
-    print("[SERVER] Actions mapping:", actions)
-
-   
-    csv_path = "/tmp/rl_bandit_fedavg_curve.csv"
-    csv_f = open(csv_path, "w", newline="")
-    csv_writer = csv.writer(csv_f)
-    csv_writer.writerow([
-        "round",
-        "action_idx",
-        "use_client1",
-        "use_client2",
-        "global_loss",
-        "round_time_ms",
-        "Q0",
-        "Q1",
-        "Q2",
-    ])
-    
-    try:
-        for round_idx in range(1, MAX_ROUNDS + 1):
-            # ---- 用 bandit 选择本轮动作 ----
-            action_idx = bandit.select_action()
-            selected_clients = actions[action_idx]
-
-            print("[SERVER][round {}] action={}, selected={}".format(
-                round_idx, action_idx, selected_clients
-            ))
-
-            # ---- 下发训练指令 ----
-            send_ts = {}
-            local_epochs = 5
-            lr = 0.02  # 稍微小一点，稳定一些
-
-            for cid in selected_clients:
-                sock, _ = clients[cid]
-                msg = {
-                    "type": "train",
-                    "round": round_idx,
-                    "w": global_w,
-                    "b": global_b,
-                    "local_epochs": local_epochs,
-                    "lr": lr,
-                }
-                send_json(sock, msg)
-                send_ts[cid] = time.time()
-
-            # ---- 接收各 client 的更新 ----
-            round_results = []
-            for cid in selected_clients:
-                _, fobj = clients[cid]
-                resp = recv_json_line(fobj)
-                if resp is None:
-                    print("[SERVER] WARNING: {} closed connection".format(cid))
-                    continue
-
-                now = time.time()
-                delay_ms = (now - send_ts[cid]) * 1000.0
-
-                new_w = float(resp.get("new_w", global_w))
-                new_b = float(resp.get("new_b", global_b))
-                local_loss = resp.get("local_loss", None)
-
-                print("[SERVER] <- {}: delay={:.3f} ms, local_loss={}".format(
-                    resp.get("client_id", cid),
-                    delay_ms,
-                    local_loss,
-                ))
-
-                round_results.append({
-                    "client_id": cid,
-                    "new_w": new_w,
-                    "new_b": new_b,
-                    "local_loss": local_loss,
-                    "delay_ms": delay_ms,
-                })
-
-            if not round_results:
-                print("[SERVER] No results in round {}, stopping".format(round_idx))
-                break
-
-            # ---- FedAvg 聚合（简单平均） ----
-            avg_w = 0.0
-            avg_b = 0.0
-            for r in round_results:
-                avg_w += r["new_w"]
-                avg_b += r["new_b"]
-            avg_w /= float(len(round_results))
-            avg_b /= float(len(round_results))
-
-            global_w = avg_w
-            global_b = avg_b
-
-            # ---- 计算 global_loss，并对 inf/NaN 做保护 ----
-            finite_losses = []
-            for r in round_results:
-                loss = r["local_loss"]
-                if loss is None:
-                    continue
-                try:
-                    loss_f = float(loss)
-                except Exception:
-                    continue
-                if math.isfinite(loss_f):
-                    finite_losses.append(loss_f)
-
-            if finite_losses:
-                global_loss = sum(finite_losses) / float(len(finite_losses))
-            else:
-                # 全是 inf/NaN，用一个很大的常数表示很差
-                global_loss = 1e3
-
-            # 用负的 global_loss 作为 reward（loss 越小 reward 越大）
-            reward = -global_loss
-
-            round_time_ms = max(r["delay_ms"] for r in round_results)
-
-            print("[SERVER][round {}] round_time={:.3f} ms, global_loss={}, reward={}".format(
-                round_idx,
-                round_time_ms,
-                global_loss,
-                reward,
-            ))
-
-            # ---- 更新 bandit Q 值 ----
-            bandit.update(action_idx, reward)
-
-             # 写入一行 CSV：这一轮用了哪些 client、loss 和 Q 值
-            use_c1 = 1 if client_order[0] in selected_clients else 0
-            use_c2 = 1 if client_order[1] in selected_clients else 0
-            q0 = bandit.q_values[0] if len(bandit.q_values) > 0 else 0.0
-            q1 = bandit.q_values[1] if len(bandit.q_values) > 1 else 0.0
-            q2 = bandit.q_values[2] if len(bandit.q_values) > 2 else 0.0
-            csv_writer.writerow([
-                round_idx,
-                action_idx,
-                use_c1,
-                use_c2,
-                global_loss,
-                round_time_ms,
-                q0, q1, q2,
-            ])
-
-            # 打印一下 Q 状态
-            parts = []
-            for a in range(num_actions):
-                parts.append(
-                    "a{}: Q={}, n={}".format(a, bandit.q_values[a], bandit.counts[a])
-                )
-            print("[SERVER] Bandit Q-values:", " | ".join(parts))
-
-        print("[SERVER] Training finished. Final global model: w={}, b={}".format(
-            global_w, global_b
-        ))
-
-        # 告诉各个 client 停止
-        stop_msg = {"type": "stop"}
-        for cid, (sock, _) in clients.items():
-            try:
-                send_json(sock, stop_msg)
-            except Exception:
-                pass
-                
-    finally:
+def init_server_log():
+    if not os.path.exists("/tmp"):
         try:
-            csv_f.close()
-            print("[SERVER] CSV saved to", csv_path)
+            os.makedirs("/tmp")
         except Exception:
             pass
-        for cid, (sock, fobj) in clients.items():
+    if not os.path.exists(SERVER_LOG):
+        with open(SERVER_LOG, "w") as f:
+            f.write("round,action_idx,use_client1,use_client2,"
+                    "global_loss,round_time_ms,Q0,Q1,Q2\n")
+
+
+def append_server_log(round_idx, action_idx, use_c1, use_c2,
+                      global_loss, round_time_ms, Q):
+    line = "%d,%d,%d,%d,%.10f,%.3f,%.10f,%.10f,%.10f\n" % (
+        int(round_idx),
+        int(action_idx),
+        int(use_c1),
+        int(use_c2),
+        float(global_loss),
+        float(round_time_ms),
+        float(Q[0]),
+        float(Q[1]),
+        float(Q[2]),
+    )
+    with open(SERVER_LOG, "a") as f:
+        f.write(line)
+
+
+# ------------- 主流程 ------------- #
+
+def run_server(port=PORT):
+    print("[SERVER] Listening on 0.0.0.0:%d ..." % port)
+
+    # 1) 创建监听 socket
+    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lsock.bind(("0.0.0.0", port))
+    lsock.listen(5)
+
+    # 2) 等待两个 client 连接并发送 HELLO
+    clients = []   # 每个元素: {"id": "client1", "sock": sock, "file": f}
+    while len(clients) < 2:
+        csock, addr = lsock.accept()
+        fobj = csock.makefile("r")
+        msg = recv_json_line(fobj)
+        if msg is None or msg.get("type") != "HELLO":
+            # 不符合协议就关掉
             try:
                 fobj.close()
             except Exception:
                 pass
             try:
-                sock.close()
+                csock.close()
             except Exception:
                 pass
-        server_sock.close()
-        print("[SERVER] Closed all connections.")
+            continue
+
+        cid = msg.get("client_id", "client%d" % (len(clients) + 1))
+        info = {"id": cid, "sock": csock, "file": fobj}
+        clients.append(info)
+        print("[SERVER] accepted %s from %s:%d" %
+              (cid, addr[0], addr[1]))
+
+    # 简单根据 client_id 排一下，让 client1 在下标0，client2在下标1
+    def client_sort_key(x):
+        cid = x["id"]
+        if cid == "client1":
+            return 0
+        if cid == "client2":
+            return 1
+        return 2
+
+    clients.sort(key=client_sort_key)
+
+    # 3) 初始化模型参数
+    w = 0.0
+    b = 0.0
+
+    # bandit 行动：0=两端都选, 1=只选 client1, 2=只选 client2
+    actions = [
+        [0, 1],
+        [0],
+        [1],
+    ]
+    Q, N = bandit_init(len(actions))
+
+    init_server_log()
+
+    # 4) 训练循环
+    for rnd in range(1, NUM_ROUNDS + 1):
+        start_t = time.time()
+
+        # 4.1 选择 bandit 动作（决定这一轮用哪些 client）
+        action_idx = bandit_select_action(Q, N, eps=0.1)
+        selected_indices = actions[action_idx]
+
+        use_c1 = 1 if 0 in selected_indices else 0
+        use_c2 = 1 if 1 in selected_indices else 0
+
+        print("[SERVER] [round %d] action=%d, selected=%s" %
+              (rnd, action_idx, str(selected_indices)))
+
+        # 4.2 向被选中的 client 发送 TRAIN
+        for i in selected_indices:
+            info = clients[i]
+            msg = {
+                "type": "TRAIN",
+                "round": rnd,
+                "w": w,
+                "b": b,
+                "local_epochs": LOCAL_EPOCHS,
+                "lr": LR,
+            }
+            send_json(info["sock"], msg)
+
+        # 4.3 接收 UPDATE 并做 FedAvg
+        agg_w = []
+        agg_b = []
+        agg_loss = []
+
+        for i in selected_indices:
+            info = clients[i]
+            resp = recv_json_line(info["file"])
+            if resp is None or resp.get("type") != "UPDATE":
+                # 如果某个 client 异常，中断训练
+                print("[SERVER] client %s disconnected during UPDATE." %
+                      info["id"])
+                break
+
+            new_w = resp.get("w", w)
+            new_b = resp.get("b", b)
+            local_loss = resp.get("local_loss", 0.0)
+
+            agg_w.append(float(new_w))
+            agg_b.append(float(new_b))
+            agg_loss.append(float(local_loss))
+
+            print("[SERVER] <- %s: round=%d, local_loss=%.6f" %
+                  (info["id"], rnd, local_loss))
+
+        # 如果这一轮没人被选中，就跳过
+        if len(agg_w) > 0:
+            w = sum(agg_w) / float(len(agg_w))
+            b = sum(agg_b) / float(len(agg_b))
+            global_loss = sum(agg_loss) / float(len(agg_loss))
+        else:
+            global_loss = 0.0
+
+        round_time_ms = (time.time() - start_t) * 1000.0
+
+        # 4.4 用 -global_loss 作为 reward 更新 bandit
+        # loss 越小 reward 越大
+        reward = -float(global_loss)
+        bandit_update(Q, N, action_idx, reward)
+
+        print("[SERVER] [round %d] round_time=%.3f ms, global_loss=%.6f | "
+              "Q0=%.6f, Q1=%.6f, Q2=%.6f"
+              % (rnd, round_time_ms, global_loss, Q[0], Q[1], Q[2]))
+
+        append_server_log(rnd, action_idx, use_c1, use_c2,
+                          global_loss, round_time_ms, Q)
+
+    # 5) 发送 STOP 并关闭连接
+    stop_msg = {"type": "STOP"}
+    for info in clients:
+        try:
+            send_json(info["sock"], stop_msg)
+        except Exception:
+            pass
+
+    for info in clients:
+        try:
+            info["file"].close()
+        except Exception:
+            pass
+        try:
+            info["sock"].close()
+        except Exception:
+            pass
+
+    try:
+        lsock.close()
+    except Exception:
+        pass
+
+    print("[SERVER] training finished. Final global model: w=%.6f, b=%.6f" %
+          (w, b))
 
 
 if __name__ == "__main__":
