@@ -114,44 +114,62 @@ def init_net_logger(client_id):
 
 
 def measure_delay(server_host, count):
-    cmd = ["ping", "-c", str(count), server_host]
+    """
+    对 server_host 做一次 ping 探测，返回：
+    sent, received, loss(0~1), rtt_min_ms, rtt_avg_ms, rtt_max_ms, delay_avg_ms
+    解析失败时返回 0,0,1.0,0,0,0,0，并在控制台打印错误信息。
+    """
+    # -q 只输出汇总，-i 0.2 稍微快一点
+    cmd = ["ping", "-c", str(count), "-i", "0.2", "-q", server_host]
+
     try:
-        p = subprocess.Popen(cmd,
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
-        out, err = p.communicate(timeout=15)
-        text = out.decode("utf-8", "ignore")
-    except Exception:
+        out = subprocess.check_output(
+            cmd,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=20,
+        )
+    except subprocess.CalledProcessError as e:
+        # ping 返回非 0 也把输出拿来解析
+        out = e.output
+    except Exception as e:
+        print("[NET] ping failed:", e)
         return 0, 0, 1.0, 0.0, 0.0, 0.0, 0.0
 
-    sent = 0
-    received = 0
-    loss = 1.0
-    rtt_min = 0.0
-    rtt_avg = 0.0
-    rtt_max = 0.0
+    sent = received = None
+    loss = None
+    rtt_min = rtt_avg = rtt_max = None
 
-    for line in text.splitlines():
+    for line in out.splitlines():
         line = line.strip()
 
+        # 形如：
+        # 10 packets transmitted, 10 received, 0% packet loss, time 9011ms
         if "packets transmitted" in line:
             parts = line.split(",")
             try:
                 sent = int(parts[0].split()[0])
                 received = int(parts[1].split()[0])
-                loss_str = parts[2].strip().split()[0].replace("%", "")
-                loss = float(loss_str) / 100.0
-            except Exception:
-                pass
+                loss_str = parts[2].strip().split()[0]  # "0%"
+                loss = float(loss_str.strip("%")) / 100.0
+            except Exception as e:
+                print("[NET] parse tx/rx line failed:", e, "line=", line)
 
-        if "min/avg/max" in line and "=" in line:
+        # 形如：
+        # rtt min/avg/max/mdev = 0.274/0.310/0.345/0.019 ms
+        if "rtt min/avg/max" in line and "=" in line:
             try:
                 stats = line.split("=")[1].strip().split()[0].split("/")
                 rtt_min = float(stats[0])
                 rtt_avg = float(stats[1])
                 rtt_max = float(stats[2])
-            except Exception:
-                pass
+            except Exception as e:
+                print("[NET] parse rtt line failed:", e, "line=", line)
+
+    # 如果有任何一个字段没解析到，就认为失败
+    if (sent is None or received is None or
+            loss is None or rtt_avg is None):
+        return 0, 0, 1.0, 0.0, 0.0, 0.0, 0.0
 
     delay_avg = rtt_avg / 2.0
     return sent, received, loss, rtt_min, rtt_avg, rtt_max, delay_avg
