@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Minimal FedAvg client (Python 3.4 compatible)
+Robust FedAvg client (Python 3.4 compatible)
 - Persistent TCP connection
 - HELLO then wait for TRAIN
 - Local training: toy linear regression on synthetic data
 - Sends UPDATE with (w,b,local_loss)
-- Optional server auto-discovery within /24
+- Auto-discovery within /24
+- Auto reconnect & re-discover on disconnect (very useful on testbeds)
 """
 
 from __future__ import print_function
 
-import os
 import sys
 import time
 import json
@@ -23,6 +23,13 @@ PORT = 5000
 
 TARGET_W = 2.0
 TARGET_B = 3.0
+
+DISCOVER_PER_IP_TIMEOUT = 0.10
+DISCOVER_MAX_PASSES = 10
+DISCOVER_SLEEP_BETWEEN = 0.8
+
+RECONNECT_SLEEP = 1.0
+
 
 # --------------------------
 # JSON line helpers
@@ -41,12 +48,13 @@ def recv_json_line(fobj):
         return None
     return json.loads(line)
 
+
 # --------------------------
 # Auto-discovery
 # --------------------------
 
 def get_my_ip():
-    # More robust than hostname -I for some nodes
+    # UDP trick
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -55,22 +63,42 @@ def get_my_ip():
         return ip
     except Exception:
         pass
+
+    # fallback
     try:
         out = subprocess.check_output(["hostname", "-I"]).decode("utf-8").split()
         if out:
             return out[0]
     except Exception:
         pass
+
     return "127.0.0.1"
 
-def discover_server(port, per_ip_timeout=0.08, max_passes=5, sleep_between=1.0):
+def can_connect(ip, port, timeout_sec):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout_sec)
+    try:
+        s.connect((ip, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+def discover_server(port,
+                    per_ip_timeout=DISCOVER_PER_IP_TIMEOUT,
+                    max_passes=DISCOVER_MAX_PASSES,
+                    sleep_between=DISCOVER_SLEEP_BETWEEN):
     my_ip = get_my_ip()
     parts = my_ip.split(".")
     if len(parts) != 4:
         raise RuntimeError("Cannot infer /24 prefix from my_ip={0}".format(my_ip))
     prefix = ".".join(parts[0:3])
 
-    print("[discover] my_ip = {0}, scanning {1}.0/24 ...".format(my_ip, prefix))
+    print("[discover] my_ip={0}, scanning {1}.0/24 port={2}".format(my_ip, prefix, port))
 
     for p in range(1, max_passes + 1):
         print("[discover] pass {0}/{1}".format(p, max_passes))
@@ -78,29 +106,19 @@ def discover_server(port, per_ip_timeout=0.08, max_passes=5, sleep_between=1.0):
             ip = "{0}.{1}".format(prefix, i)
             if ip == my_ip:
                 continue
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(per_ip_timeout)
-            try:
-                s.connect((ip, port))
-                s.close()
-                print("[discover] found server at {0}".format(ip))
+            if can_connect(ip, port, per_ip_timeout):
+                print("[discover] found server at {0}:{1}".format(ip, port))
                 return ip
-            except Exception:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-                continue
         time.sleep(sleep_between)
 
     raise RuntimeError("Server not found on {0}.0/24 after {1} passes".format(prefix, max_passes))
+
 
 # --------------------------
 # Toy data + training
 # --------------------------
 
 def make_local_data(client_id, n=100):
-    # Deterministic per-client
     seed = 1234 if str(client_id) == "client1" else 5678
     rnd = random.Random(seed)
 
@@ -127,7 +145,6 @@ def train_one_round(xs, ys, w_init, b_init, local_epochs, lr):
     b = float(b_init)
 
     for _ in range(int(local_epochs)):
-        # full batch GD
         gw = 0.0
         gb = 0.0
         n = float(len(xs))
@@ -143,18 +160,13 @@ def train_one_round(xs, ys, w_init, b_init, local_epochs, lr):
     loss = mse(xs, ys, w, b)
     return w, b, loss
 
+
 # --------------------------
-# Main
+# Main loop with reconnect
 # --------------------------
 
-def run_client(client_id, server_arg, port):
-    if server_arg == "auto":
-        server_host = discover_server(port)
-    else:
-        server_host = server_arg
-
+def connect_and_run_once(client_id, server_host, port, xs, ys):
     print("[CLIENT {0}] connect to {1}:{2}".format(client_id, server_host, port))
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((server_host, port))
     fobj = sock.makefile("r")
@@ -162,14 +174,11 @@ def run_client(client_id, server_arg, port):
     send_json(sock, {"type": "HELLO", "client_id": str(client_id)})
     print("[CLIENT {0}] sent HELLO".format(client_id))
 
-    xs, ys = make_local_data(client_id)
-
-    # initialize with zeros to match server
     while True:
         msg = recv_json_line(fobj)
         if msg is None:
             print("[CLIENT {0}] socket closed by server.".format(client_id))
-            break
+            return False  # reconnect
 
         mtype = msg.get("type", "")
         if mtype == "TRAIN":
@@ -180,7 +189,6 @@ def run_client(client_id, server_arg, port):
             lr = float(msg.get("lr", 0.02))
 
             new_w, new_b, local_loss = train_one_round(xs, ys, w, b, local_epochs, lr)
-
             print("[CLIENT {0}] round={1} local_loss={2:.6f} -> send UPDATE".format(
                 client_id, rnd, local_loss
             ))
@@ -195,23 +203,36 @@ def run_client(client_id, server_arg, port):
 
         elif mtype == "STOP":
             print("[CLIENT {0}] got STOP, exit.".format(client_id))
-            break
+            return True  # finished
+
         else:
             print("[CLIENT {0}] unknown msg: {1}".format(client_id, msg))
 
-    try:
-        fobj.close()
-    except Exception:
-        pass
-    try:
-        sock.close()
-    except Exception:
-        pass
+
+def run_client(client_id, server_arg, port):
+    xs, ys = make_local_data(client_id)
+
+    while True:
+        try:
+            if server_arg == "auto":
+                server_host = discover_server(port)
+            else:
+                server_host = server_arg
+
+            finished = connect_and_run_once(client_id, server_host, port, xs, ys)
+            if finished:
+                return
+
+        except Exception as e:
+            print("[CLIENT {0}] error: {1}".format(client_id, e))
+
+        time.sleep(RECONNECT_SLEEP)
+
 
 if __name__ == "__main__":
-    # Usage: python3 client_fedavg_py34.py <client_id> <server_ip|auto> [port]
+    # Usage: python3 client_fedavg_py34_robust.py <client_id> <server_ip|auto> [port]
     if len(sys.argv) < 3:
-        print("Usage: python3 client_fedavg_py34.py <client_id> <server_ip|auto> [port]")
+        print("Usage: python3 client_fedavg_py34_robust.py <client_id> <server_ip|auto> [port]")
         sys.exit(1)
 
     cid = sys.argv[1]
