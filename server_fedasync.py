@@ -4,7 +4,8 @@ import socket, json, time, os, math
 PORT = 5000
 TOTAL_UPDATES = 400   # 总共接受多少次 client 更新（两 client 各 200 次 => 400）
 METHOD = "fedasync"
-LOG_PATH = "/tmp/global_metrics_fedasync.csv"
+LOG_PATH = os.path.join(os.environ.get("HOME", "/tmp"), "global_metrics_fedasync.csv")
+
 
 # 异步混合：alpha(staleness)=base_alpha / (1+staleness)
 BASE_ALPHA = 0.6
