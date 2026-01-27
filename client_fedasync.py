@@ -18,10 +18,9 @@ LR = 0.1
 EPS = 0.5
 METHOD = "fedasync"
 
-PING_COUNT = 50
 # 建议写到 HOME，避免 /tmp permission denied
 PING_LOG_DIR = os.path.join(os.environ.get("HOME", "/tmp"), "fed4fire_logs")
-PING_ENABLED = True
+PING_ENABLED = False
 
 
 def send_json(sock, obj):
